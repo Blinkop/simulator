@@ -38,8 +38,8 @@ def get_args():
         type=int
     )
     parser.add_argument(
-        "-mhl",
-        "--min_history_length",
+        "-ihl",
+        "--init_history_length",
         help="minimum number of items at initial state",
         type=int
     )
@@ -109,31 +109,33 @@ def run_simulation(args: Namespace):
         n_multinomial=args.n_multinomial,
         sasrec_path=args.sasrec_file,
         device=args.device,
+        rewards_gamma=args.gamma,
         seed=args.random_seed
     )
 
     sim.initialize(
         num_users=args.num_users,
-        min_history_len=args.min_history_length
+        init_history_len=args.init_history_length
     )
 
-    sasrec = torch.load(args.policy_file).to(args.device)
+    sasrec = torch.load(args.policy_file, weights_only=False).to(args.device)
     sasrec.eval()
 
     rewards = []
-    batch_sequences = sim.start(batch_size=args.users_per_round)
 
-    for i in tqdm(
+    for _ in tqdm(
         range(args.simulation_iterations),
         total=args.simulation_iterations
     ):
+        batch_sequences = sim.get_next_batch(batch_size=args.users_per_round)
+
         actions = {}
 
         for u, seq in batch_sequences.items():
             actions[u] = sasrec_prediction(seq=seq, model=sasrec, args=args)
 
-        batch_sequences, r = sim.step(actions=actions, gamma=args.gamma)
-        rewards.append(r)
+        step_rewards = sim.step(actions=actions)
+        rewards.append(step_rewards)
 
     return sim.log_df, np.array(rewards)
 
@@ -153,10 +155,10 @@ def main():
     log_df.to_csv(exp_folder / "log.csv", index=False)
 
     sns.set_theme()
-    plt.title("simulator rewards")
+    plt.title(f"simulator rewards (avg: {rewards.mean()})")
     plt.xlabel("simulator iteration")
     plt.ylabel("discounted reward")
-    plt.plot(moving_average(rewards.mean(axis=1), n=25))
+    plt.plot(rewards.mean(axis=1))
     plt.savefig(exp_folder / "rewards.pdf", bbox_inches="tight")
     plt.close()
 

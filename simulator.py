@@ -9,14 +9,22 @@ import pandas as pd
 
 
 class AbstractSimulator(abc.ABC):
-    def __init__(self, seed: int = None):
+
+    INITIAL_SOURCE = 'initial'
+    POLICY_SOURCE = 'policy'
+    OTHER_SOURCE = 'other'
+
+    def __init__(self, rewards_gamma: float = 1.0, seed: int = None):
         super().__init__()
 
+        self._gamma = rewards_gamma
         self._seed = seed
         self._numpy_generator = np.random.default_rng(self._seed)
 
-        self._initialized = False
+        self._history = {} # user : (item, source, rating)
         self._num_items = 0
+
+        self._initialized = False
 
     @property
     def log_df(self):
@@ -25,13 +33,15 @@ class AbstractSimulator(abc.ABC):
 
         max_seq_len = max([len(seq) for _, seq in self._history.items()])
 
-        return pd.concat([
-            pd.DataFrame({
-                'userid' : [u] * len(seq),
-                'movieid' : seq,
-                'timestamp' : np.linspace(0, max_seq_len - 1, len(seq)).round().astype(int)
-            }) for u, seq in self._history.items()
-        ])
+        user_dfs = []
+        for u, seq in self._history.items():
+            user_df = pd.DataFrame(seq, columns=['movieid', 'source', 'rating'])
+            user_df['userid'] = u
+            user_df['timestamp'] = np.linspace(0, max_seq_len - 1, len(seq)).round().astype(int)
+
+            user_dfs.append(user_df[['userid', 'movieid', 'rating', 'timestamp', 'source']])
+
+        return pd.concat(user_dfs)
     
     @property
     def item_ids(self):
@@ -42,83 +52,67 @@ class AbstractSimulator(abc.ABC):
 
     def _compute_rewards(
         self,
-        response: Dict[int, np.ndarray],
-        gamma: float = 1.0,
-        count_init_lengths: bool = True
+        response: Dict[int, bool],
+        gamma: float = 1.0
     ):
-        rewards = np.array([np.mean(r.astype(int)) for _, r in response.items()])
-        lengths = {u : len(self._history[u]) for u in response}
+        discounted_rewards = [
+            int(r) * (gamma ** len(self.get_policy_sequence(u)))
+            for u, r in response.items()
+        ]
 
-        if not count_init_lengths:
-            lengths = {u : lengths[u] - self._initial_seq_lengths[u] for u in response}
+        return np.array(discounted_rewards)
 
-        rewards = rewards * gamma ** np.array([l for _, l in lengths.items()])
+    def get_positive_sequence(self, user_id: int):
+        user_history = list(zip(*self._history[user_id]))
+        ratings_mask = np.array(user_history[-1]) > 0
 
-        return rewards
+        return np.array(user_history[0])[ratings_mask].tolist()
     
-    def _append_history(
-        self,
-        actions: Dict[int, Iterable[int]],
-        response: Dict[int, np.ndarray]
-    ):
-        for u in self._current_users:
-            self._history[u] += (
-                np.array(actions[u])[response[u].astype(bool)].tolist()
-            )
+    def get_policy_sequence(self, user_id: int):
+        user_history = list(zip(*self._history[user_id]))
+        policy_mask = np.array(user_history[1]) == self.POLICY_SOURCE
 
-    def _fix_initial_lenghts(self):
-        self._initial_seq_lengths = {u : len(seq) for u, seq in self._history.items()}
+        return np.array(user_history[0])[policy_mask].tolist()
 
-    def initialize(self, num_users: int, min_history_len: int):
+    def initialize(self, num_users: int):
         if num_users <= 0:
             raise ValueError(f'number of users must be a positive number')
         
-        if min_history_len <= 0:
-            raise ValueError(f'minimal history length must be a positive number')
-        
         self._num_users = num_users
-        self._history = {u : [] for u in range(self._num_users)}
-        self._fix_initial_lenghts()
+
+        for u in range(self._num_users):
+            self._history[u] = []
 
         self._initialized = True
 
     def initialize_from_log(self, df: pd.DataFrame):
         df = df.sort_values(['timestamp']).reset_index(drop=True)
+        df = df[['userid', 'movieid', 'rating', 'timestamp', 'source']]
         
-        self._num_users = len(df['userid'].unique())
+        num_users = len(df['userid'].unique())
 
-        if self._num_users <= df['userid'].max():
+        if df['userid'].max() >= num_users:
             raise ValueError('user ids are not dense')
         
-        if self._num_items <= df['movieid'].max():
+        if df['movieid'].max() >= self._num_items:
             raise ValueError('item ids are not dense')
-
-        history = df.groupby('userid')['movieid'].apply(list)
-        self._history = {u : seq for u, seq in history.items()}
-
-        self._fix_initial_lenghts()
-
-        self._initialized = True
+        
+        self.initialize(num_users=num_users)
+        
+        for row in df.itertuples(index=False, name=None):
+            self._history[row[0]].append((row[1], row[4], row[2]))
     
-    def get_history_length(self, user_ids: Iterable = None):
-        if user_ids is None:
-            user_ids = [u for u in self._history]
-
-        return {u: len(self._history[u]) for u in user_ids}
-    
-    def start(self, batch_size: int):
-        self._batch_size = batch_size
-
+    def get_next_batch(self, batch_size: int):
         self._current_users = self._numpy_generator.choice(
-            self._num_users, size=self._batch_size, replace=False
+            self._num_users, size=batch_size, replace=False
         )
 
-        return {u : self._history[u] for u in self._current_users}
+        return {u : self.get_positive_sequence(u) for u in self._current_users}
     
     @abc.abstractmethod
     def step(
         self,
-        actions: Dict[int, Union[int, Iterable[int]]],
+        actions: Dict[int, int],
         gamma: float = 1.0
     ):
         raise NotImplementedError()
@@ -129,13 +123,16 @@ class AbstractSasrecSimulator(AbstractSimulator):
         self,
         sasrec_path: str,
         device: str = 'cpu',
+        rewards_gamma: float = 1.0,
         seed: int = None
     ):
-        super().__init__(seed=seed)
+        super().__init__(rewards_gamma=rewards_gamma, seed=seed)
 
         self._device = device
 
-        self._sasrec = torch.load(sasrec_path).to(self._device)
+        self._sasrec = torch.load(
+            sasrec_path, weights_only=False
+        ).to(self._device)
         self._sasrec.eval()
 
         self._num_items = self._sasrec.item_num
@@ -143,27 +140,28 @@ class AbstractSasrecSimulator(AbstractSimulator):
     def initialize(
         self,
         num_users: int,
-        min_history_len: int
+        init_history_len: int
     ):
-        super().initialize(num_users=num_users, min_history_len=min_history_len)
+        super().initialize(num_users=num_users)
 
-        for u in range(self._num_users):
-            self._history[u] += self._numpy_generator.choice(
-                self._num_items, size=min_history_len, replace=False
+        for u in self._history:
+            random_items = self._numpy_generator.choice(
+                self._num_items, size=init_history_len, replace=False
             ).tolist()
+
+            for item in random_items:
+                self._history[u].append((item, self.INITIAL_SOURCE, 1))
 
         items_not_in_log = (
             self.item_ids[~np.isin(
                 self.item_ids,
-                [item for _, seq in self._history.items() for item in seq]
+                [item for _, seq in self._history.items() for item, _, _ in seq]
             )]
         )
 
         for iid in tqdm(items_not_in_log):
             rand_user = self._numpy_generator.choice(self._num_users, size=1).item()
-            self._history[rand_user].append(iid)
-
-        self._fix_initial_lenghts()
+            self._history[rand_user].append((iid, self.INITIAL_SOURCE, 1))
 
 
 class SasrecSimulator(AbstractSasrecSimulator):
@@ -172,11 +170,13 @@ class SasrecSimulator(AbstractSasrecSimulator):
         n_multinomial: int,
         sasrec_path: str,
         device: str,
+        rewards_gamma: float = 1.0,
         seed: int = None
     ):
         super().__init__(
             sasrec_path=sasrec_path,
             device=device,
+            rewards_gamma=rewards_gamma,
             seed=seed
         )
 
@@ -185,17 +185,12 @@ class SasrecSimulator(AbstractSasrecSimulator):
     @torch.no_grad()
     def step(
         self,
-        actions: Dict[int, Union[int, Iterable[int]]],
-        gamma: float = 1.0,
-        count_initial_length: bool = True
+        actions: Dict[int, int]
     ):
-        for u, a in actions.items():
-            if np.isscalar(a):
-                actions[u] = [a]
-
         response = {}
+
         for u in self._current_users:
-            seq = self._history[u]
+            seq = self.get_positive_sequence(u)
             seq_tensor = torch.LongTensor(seq).to(self._device)
             logits = self._sasrec.score(seq_tensor).flatten().detach().cpu()[:-1]
 
@@ -212,13 +207,10 @@ class SasrecSimulator(AbstractSasrecSimulator):
                 p=logits_softmax
             )
 
-            response[u] = np.isin(actions[u], user_choice)
+            response[u] = np.isin(actions[u], user_choice).item()
 
-            if not response[u].any():
-                self._history[u] = self._history[u] + [user_choice[0]]
-            else:
-                self._history[u] = self._history[u] + np.array(actions[u])[response[u]].tolist()
+            self._history[u].append((actions[u], self.POLICY_SOURCE, int(response[u])))
+            if not response[u]:
+                self._history[u].append((user_choice[0], self.OTHER_SOURCE, 1))
 
-        rewards = self._compute_rewards(response, gamma, count_initial_length)
-
-        return self.start(self._batch_size), rewards
+        return self._compute_rewards(response=response, gamma=self._gamma)
